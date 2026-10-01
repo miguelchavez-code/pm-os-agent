@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -127,6 +128,66 @@ def log_verdict(which: str, step: int, revisions: int, verdict: dict) -> None:
         f.write(json.dumps(rec) + "\n")
 
 
+# --- M4 retrieval plan: scope every pull to the task's project -----------------
+def parse_scope(body: str) -> tuple[str | None, str | None]:
+    """Read the run's project from the brief's 'Project: P-XXX (Name)' line."""
+    m = re.search(r"Project:\s*(P-[A-Z0-9-]+)\s*\(([^)]+)\)", body)
+    return (m.group(1), m.group(2).strip()) if m else (None, None)
+
+
+def _same_project(label: str, pname: str) -> bool:
+    label, pname = (label or "").lower(), pname.lower()
+    return bool(label) and (label == pname or label in pname)
+
+
+def scoped_past_updates(pname: str) -> dict:
+    """Routing + grading + reranking: this project only, newest first, top 2."""
+    ups = [u for u in tools._load_json("past-updates.json")
+           if _same_project(u.get("project", ""), pname)]
+    ups.sort(key=lambda u: u.get("week", ""), reverse=True)
+    decs = [d for d in tools._load_json("decision-log.json")
+            if _same_project(d.get("project", ""), pname) or d.get("project") == "team"]
+    decs.sort(key=lambda d: d.get("date", ""), reverse=True)
+    return {"project": pname, "updates": ups[:2], "decisions": decs[:2],
+            "note": "routed to this project, newest first, top 2. Past numbers are "
+                    "precedent/format only, never current facts."}
+
+
+def scoped_roadmap(pname: str) -> dict:
+    """Routing + grading: this project's section only; CONFIDENTIAL dropped unseen."""
+    text = (tools.FIXTURES / "roadmap.md").read_text()
+    sections = re.split(r"(?m)^(?=## )", text)
+    keep, hidden = [], 0
+    for sec in sections[1:]:
+        if "CONFIDENTIAL" in sec.upper():
+            hidden += 1
+            continue
+        if pname.lower().split()[0] in sec.splitlines()[0].lower():
+            keep.append(sec.strip())
+    return {"project": pname,
+            "roadmap": "\n\n".join(keep) or "(no shareable roadmap section for this project)",
+            "filtered_out_confidential": hidden,
+            "note": "confidential sections were removed before you saw them."}
+
+
+def call_tool(fn: str, args: dict, scope: tuple[str | None, str | None]) -> dict:
+    pid, pname = scope
+    if pid and fn in ("get_project", "get_activity", "propose_stories"):
+        req = str(args.get("project_id", "")).strip()
+        if req != pid:
+            return {"error": "out_of_scope_project", "requested": req, "allowed": pid,
+                    "hint": "this run is scoped to the task's project only"}
+    if pname and fn == "search_past_updates":
+        return scoped_past_updates(pname)
+    if pname and fn == "get_roadmap":
+        return scoped_roadmap(pname)
+    result = tools.TOOLS[fn](**args)
+    # M4 grading: never hand Cortex the list of other (incl. confidential) projects.
+    if isinstance(result, dict):
+        result.pop("known_projects", None)
+    return result
+
+
 def banner(text: str) -> None:
     print(f"\n{'=' * 64}\n{text}\n{'=' * 64}")
 
@@ -183,6 +244,7 @@ def run(which: str = "happy") -> None:
     queued_count: int | None = None      # set when propose_stories confirms a queue
     batch_rejected = False               # set when the queue cap rejects a batch
     stories_requested = "stor" in task["body"].lower()
+    scope = parse_scope(task["body"])  # M4 routing: (project_id, project_name)
 
     for step in range(1, MAX_ITERATIONS + 1):
         if bounds.over_cap():
@@ -202,7 +264,7 @@ def run(which: str = "happy") -> None:
             for call in msg.tool_calls:
                 fn = call.function.name
                 args = json.loads(call.function.arguments or "{}")
-                result = tools.TOOLS[fn](**args)
+                result = call_tool(fn, args, scope)
                 source_log.append(f"{fn}({args}) -> {json.dumps(result)}")
                 print(f"\n[step {step}] TOOL {fn}({args})")
                 print(f"          -> {json.dumps(result)[:300]}")
