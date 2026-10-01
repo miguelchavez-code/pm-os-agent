@@ -49,6 +49,9 @@ MAX_ITERATIONS = int(os.environ.get("CORTEX_MAX_ITERATIONS", "8"))
 MAX_REVISIONS = int(os.environ.get("CORTEX_MAX_REVISIONS", "2"))
 COST_CAP_USD = float(os.environ.get("CORTEX_COST_CAP_USD", "0.50"))
 MAX_QUEUE_ITEMS = int(os.environ.get("CORTEX_MAX_QUEUE_ITEMS", "10"))
+# M2 loop spec, stuck exit: give up after this many failed data pulls.
+MAX_PULL_FAILURES = int(os.environ.get("CORTEX_MAX_PULL_FAILURES", "3"))
+PULL_TOOLS = {"get_project", "get_activity"}
 # Rough $ per 1M tokens for your chosen model, set to match its pricing.
 PRICE_IN = float(os.environ.get("CORTEX_PRICE_IN_PER_M", "0.15"))
 PRICE_OUT = float(os.environ.get("CORTEX_PRICE_OUT_PER_M", "0.60"))
@@ -155,6 +158,11 @@ def run(which: str = "happy") -> None:
     source_log: list[str] = [task["body"]]
     revisions = 0
     last_draft = ""
+    # M2 loop-spec state (within-run layer, purged when the run ends).
+    pull_failures = 0
+    queued_count: int | None = None      # set when propose_stories confirms a queue
+    batch_rejected = False               # set when the queue cap rejects a batch
+    stories_requested = "stor" in task["body"].lower()
 
     for step in range(1, MAX_ITERATIONS + 1):
         if bounds.over_cap():
@@ -180,11 +188,29 @@ def run(which: str = "happy") -> None:
                 print(f"          -> {json.dumps(result)[:300]}")
                 messages.append({"role": "tool", "tool_call_id": call.id,
                                  "content": json.dumps(result)})
+                # M2 loop-spec signals, detected in code, not by the model.
+                if fn in PULL_TOOLS and "error" in result:
+                    pull_failures += 1
+                    print(f"          !! data pull failed ({pull_failures}/{MAX_PULL_FAILURES})")
+                if fn == "propose_stories":
+                    if result.get("status") == "queued_for_approval":
+                        queued_count = result.get("count", 0)
+                    elif result.get("error") == "batch_exceeds_queue_cap":
+                        batch_rejected = True
+            if pull_failures >= MAX_PULL_FAILURES:
+                reason = f"STUCK: data pull failed {pull_failures}x"
+                banner(f"STUCK, data pull failed {pull_failures}x. Stopping, logging, "
+                       f"holding the draft for a human. Run cost ≈ ${bounds.cost:.4f}")
+                emit_deliverable(which, last_draft, accepted=False,
+                                 reason=reason, cost=bounds.cost)
+                return
             continue
 
         # No tool calls => Cortex produced a proposed output. Validate it.
         proposed = msg.content or ""
         last_draft = proposed
+        # Escalate exit (M2 spec): Cortex chose ESCALATE, or infra rejected the batch.
+        is_escalate = proposed.lstrip().upper().startswith("ESCALATE") or batch_rejected
         print(f"\n[step {step}] PROPOSED OUTPUT:\n{proposed}")
 
         banner("CRITIC, independent validation")
@@ -194,33 +220,51 @@ def run(which: str = "happy") -> None:
                         + verdict["_usage"]["completion"] * PRICE_OUT) / 1_000_000
         print(json.dumps({k: v for k, v in verdict.items() if k != "_usage"}, indent=2))
 
-        if verdict["verdict"] == "pass":
-            banner(f"HITL CHECKPOINT, status update + any proposed stories queued for "
-                   f"your review. Nothing posted, no commitments made. "
+        if verdict["verdict"] == "pass" and is_escalate:
+            why = ("story batch over the queue cap" if batch_rejected
+                   else "Cortex hit a human-owned decision (#4 / #6)")
+            banner(f"ESCALATE (HITL), {why}. Stopping and asking the PM. "
+                   f"Nothing posted. Run cost ≈ ${bounds.cost:.4f}")
+            emit_deliverable(which, proposed, accepted=False,
+                             reason=f"ESCALATE: {why}", cost=bounds.cost)
+            return
+
+        missing_queue = stories_requested and queued_count is None
+        if verdict["verdict"] == "pass" and not missing_queue:
+            n = queued_count or 0
+            banner(f"SUCCESS, HITL CHECKPOINT: draft + {n} stories ready for your "
+                   f"review. Nothing posted, no commitments made. "
                    f"Run cost ≈ ${bounds.cost:.4f}")
             emit_deliverable(which, proposed, accepted=True,
-                             reason="validator passed", cost=bounds.cost)
+                             reason=f"critic passed + {n} stories queued", cost=bounds.cost)
             return
 
         if revisions >= MAX_REVISIONS:
-            reason = f"validator rejected {MAX_REVISIONS}x (revision cap)"
-            banner(f"REVISION CAP hit ({MAX_REVISIONS}). Escalating to a human "
-                   f"instead of looping. Run cost ≈ ${bounds.cost:.4f}")
+            reason = (f"STUCK: not done after {MAX_REVISIONS} revisions "
+                      f"({'stories never queued' if verdict['verdict'] == 'pass' else 'critic rejected'})")
+            banner(f"STUCK, revision cap hit ({MAX_REVISIONS}). Holding the draft for "
+                   f"a human instead of looping. Run cost ≈ ${bounds.cost:.4f}")
             emit_deliverable(which, last_draft, accepted=False,
                              reason=reason, cost=bounds.cost)
             return
 
         revisions += 1
-        print(f"\n-> critic rejected; revision {revisions}/{MAX_REVISIONS}")
         messages.append(msg)
-        messages.append({"role": "user", "content":
-                         "A validator rejected that for these reasons: "
-                         f"{verdict['reasons']}. Fix it or escalate."})
+        if verdict["verdict"] == "pass":  # good draft, but success needs the queue too
+            print(f"\n-> critic passed, but no stories queued; revision {revisions}/{MAX_REVISIONS}")
+            messages.append({"role": "user", "content":
+                             "The draft passed review, but the task asked for stories and "
+                             "none are queued. Call propose_stories, or ESCALATE."})
+        else:
+            print(f"\n-> critic rejected; revision {revisions}/{MAX_REVISIONS}")
+            messages.append({"role": "user", "content":
+                             "A validator rejected that for these reasons: "
+                             f"{verdict['reasons']}. Fix it or escalate."})
 
-    banner(f"MAX ITERATIONS ({MAX_ITERATIONS}) reached without finishing. "
-           f"Escalating. Run cost ≈ ${bounds.cost:.4f}")
+    banner(f"STUCK, max iterations ({MAX_ITERATIONS}) reached without finishing. "
+           f"Holding for a human. Run cost ≈ ${bounds.cost:.4f}")
     emit_deliverable(which, last_draft, accepted=False,
-                     reason=f"max iterations ({MAX_ITERATIONS}) reached",
+                     reason=f"STUCK: max iterations ({MAX_ITERATIONS}) reached",
                      cost=bounds.cost)
 
 
