@@ -29,6 +29,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 from openai import OpenAI
@@ -65,6 +66,24 @@ BAD_LINES = {
 # Rough $ per 1M tokens for your chosen model, set to match its pricing.
 PRICE_IN = float(os.environ.get("CORTEX_PRICE_IN_PER_M", "0.15"))
 PRICE_OUT = float(os.environ.get("CORTEX_PRICE_OUT_PER_M", "0.60"))
+# M5: price the critic at ITS model's rates (gpt-4o list price; check your provider).
+_critic_differs = CRITIC_MODEL != MODEL
+CRITIC_PRICE_IN = float(os.environ.get("CORTEX_CRITIC_PRICE_IN_PER_M",
+                                       "2.50" if _critic_differs else str(PRICE_IN)))
+CRITIC_PRICE_OUT = float(os.environ.get("CORTEX_CRITIC_PRICE_OUT_PER_M",
+                                        "10.00" if _critic_differs else str(PRICE_OUT)))
+# M5: wall-clock timeout per run, and a kill switch checked before every model call.
+TIMEOUT_S = float(os.environ.get("CORTEX_TIMEOUT_S", "90"))
+REQUEST_TIMEOUT_S = float(os.environ.get("CORTEX_REQUEST_TIMEOUT_S", "30"))
+KILL_FILE = Path(__file__).parent / "KILL"
+
+
+def kill_switch_on() -> bool:
+    return KILL_FILE.exists() or os.environ.get("CORTEX_KILL", "") == "1"
+
+
+# M5 / M1 #2: what the scoping layer removed, surfaced for PM review at 8a.
+EXCLUSIONS: list[str] = []
 
 TOOL_SCHEMAS = [
     {"type": "function", "function": {
@@ -209,6 +228,10 @@ def emit_deliverable(which: str, draft: str, *, accepted: bool,
         print("(Cortex stopped before it produced a draft, nothing to show.)")
     if not accepted:
         print(f"\nWhy it was held: {reason}")
+    excl_block = ("\n".join(f"- {e}" for e in EXCLUSIONS) if EXCLUSIONS
+                  else "- (nothing was excluded)")
+    banner("CONTEXT EXCLUSIONS (review at 8a, agent line #2)")
+    print(excl_block)
 
     if draft.strip():
         OUTPUT_DIR.mkdir(exist_ok=True)
@@ -216,14 +239,17 @@ def emit_deliverable(which: str, draft: str, *, accepted: bool,
         state = "accepted by validator" if accepted else "HELD, escalated"
         out.write_text(
             f"<!-- Cortex draft, {state}; NOT posted. Run cost ~ ${cost:.4f}. -->\n"
-            f"<!-- {reason} -->\n\n{draft.rstrip()}\n", encoding="utf-8")
+            f"<!-- {reason} -->\n\n{draft.rstrip()}\n\n"
+            f"---\n**Context exclusions (review at 8a):**\n{excl_block}\n", encoding="utf-8")
         print(f"\nSaved draft -> {out.relative_to(Path(__file__).parent)}  "
               f"(for your review, nothing was posted)")
 
 
 def run(which: str = "happy") -> None:
-    client = OpenAI()
+    client = OpenAI(timeout=REQUEST_TIMEOUT_S, max_retries=1)
     bounds = Bounds()
+    EXCLUSIONS.clear()
+    started = time.monotonic()
     task = tools.get_task(which)
     if "error" in task:
         print(task)
@@ -247,6 +273,20 @@ def run(which: str = "happy") -> None:
     scope = parse_scope(task["body"])  # M4 routing: (project_id, project_name)
 
     for step in range(1, MAX_ITERATIONS + 1):
+        if kill_switch_on():
+            banner("KILLED, kill switch is on (00-build/KILL or CORTEX_KILL=1). "
+                   "Halting before the next model call; draft held, nothing posted.")
+            emit_deliverable(which, last_draft, accepted=False,
+                             reason="KILLED: kill switch", cost=bounds.cost)
+            return
+        elapsed = time.monotonic() - started
+        if elapsed >= TIMEOUT_S:
+            reason = f"STUCK: timeout ({elapsed:.0f}s >= {TIMEOUT_S:.0f}s)"
+            banner(f"STUCK, run timeout {TIMEOUT_S:.0f}s hit. Holding for a human. "
+                   f"Run cost ≈ ${bounds.cost:.4f}")
+            emit_deliverable(which, last_draft, accepted=False,
+                             reason=reason, cost=bounds.cost)
+            return
         if bounds.over_cap():
             reason = f"cost cap ${COST_CAP_USD} hit at ${bounds.cost:.4f}"
             banner(f"BOUND TRIPPED, {reason}. Halting and escalating to a human.")
@@ -271,6 +311,13 @@ def run(which: str = "happy") -> None:
                 messages.append({"role": "tool", "tool_call_id": call.id,
                                  "content": json.dumps(result)})
                 # M2 loop-spec signals, detected in code, not by the model.
+                if result.get("filtered_out_confidential"):
+                    note = (f"{result['filtered_out_confidential']} CONFIDENTIAL roadmap "
+                            f"section(s) removed before Cortex saw them")
+                    if note not in EXCLUSIONS:
+                        EXCLUSIONS.append(note)
+                if result.get("error") == "out_of_scope_project":
+                    EXCLUSIONS.append(f"blocked out-of-scope pull: {fn}({result.get('requested')})")
                 if fn in PULL_TOOLS and "error" in result:
                     pull_failures += 1
                     print(f"          !! data pull failed ({pull_failures}/{MAX_PULL_FAILURES})")
@@ -302,8 +349,8 @@ def run(which: str = "happy") -> None:
         banner(f"CRITIC, independent validation ({CRITIC_MODEL})")
         verdict = review(client, CRITIC_MODEL, proposed, "\n".join(source_log))
         # Estimate critic spend too.
-        bounds.cost += (verdict["_usage"]["prompt"] * PRICE_IN
-                        + verdict["_usage"]["completion"] * PRICE_OUT) / 1_000_000
+        bounds.cost += (verdict["_usage"]["prompt"] * CRITIC_PRICE_IN
+                        + verdict["_usage"]["completion"] * CRITIC_PRICE_OUT) / 1_000_000
         print(json.dumps({k: v for k, v in verdict.items() if k != "_usage"}, indent=2))
         log_verdict(which, step, revisions, verdict)
 

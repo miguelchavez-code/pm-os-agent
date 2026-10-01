@@ -22,3 +22,6 @@ __pycache__/
 /runs/
 # Cortex draft output (status updates it drafts locally, never posted)
 00-build/run-output/
+
+# M5 kill switch flag file, never commit it on
+00-build/KILL
