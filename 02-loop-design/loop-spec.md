@@ -29,7 +29,7 @@ A status update grounded in pulled activity has passed the critic, and the story
 | **Stuck / give up** | A data pull fails 3×, **or** the critic rejects 2× (`MAX_REVISIONS`), **or** 8 iterations pass without success (`MAX_ITERATIONS`) | Stop, log the reason, hold the last draft (not posted), notify PM. *To avoid infinite loops.* |
 | **Escalate to human** | A date or status change Green→Amber/Red (#4), an at-risk flag that needs routing (#6), or a story batch over the cap of 10 (#7) | HITL checkpoint from agent-line-map: stop and ask the PM. Batches over the cap are rejected, not trimmed. *To keep alignment to our initial decisions.* |
 
-**Observed (M2 re-run, `missing-data`):** after 2 failed pulls for `P-HALO`, Cortex wandered to other projects' activity (P-VEGA, P-NORTH, P-ORBIT). Those pulls succeeded, so the 3-failure exit never fired, and the 8-iteration cap halted it as STUCK. This also breaks §4's one-project scope. **Fix planned:** restrict pulls to the task's project (M4 context / M5 bounds).
+**Observed (M2 re-run, `missing-data`):** after 2 failed pulls for `P-HALO`, Cortex wandered to other projects' activity (P-VEGA, P-NORTH, P-ORBIT). Those pulls succeeded, so the 3-failure exit never fired, and the 8-iteration cap halted it as STUCK. This also breaks §4's one-project scope. **Fix planned:** restrict pulls to the task's project (M4 context / M5 bounds). **✅ Fixed in M4:** project-scoped retrieval in `agent.py` (`call_tool`). Out-of-project pulls now count as failed pulls, so `missing-data` hits the 3-failure STUCK exit in 3 steps instead of 8.
 
 ## 4. State
 
