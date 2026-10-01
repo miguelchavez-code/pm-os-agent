@@ -26,6 +26,8 @@ def review(client, model: str, proposed_output: str, source_data: str) -> dict:
     try:
         verdict = json.loads(resp.choices[0].message.content)
     except (json.JSONDecodeError, TypeError):
-        verdict = {"verdict": "fail", "reasons": ["critic returned unparseable output"]}
+        verdict = {"verdict": "fail", "failed_checks": [],
+                   "reasons": ["critic returned unparseable output"]}
+    verdict.setdefault("failed_checks", [])
     verdict["_usage"] = {"prompt": usage.prompt_tokens, "completion": usage.completion_tokens}
     return verdict
